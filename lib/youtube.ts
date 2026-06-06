@@ -97,28 +97,54 @@ function logProviderFailure(
 }
 
 /**
- * Provider 3 — hit YouTube's `timedtext` endpoint directly. This is a stable
- * server-side API that serves caption tracks as XML and tends to work from
- * serverless IPs (where the watch page + InnerTube endpoints get bot-flagged).
+ * Realistic Chrome-on-Windows request headers. YouTube's bot detection
+ * fingerprints several signals at once — a lone User-Agent isn't enough.
+ * We mimic the full set of headers a real browser sends on a watch page
+ * navigation so the response includes the full `ytInitialPlayerResponse`
+ * (with captionTracks) instead of a consent/bot-check stub.
+ */
+const BROWSER_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept":
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Cache-Control": "no-cache",
+  "Pragma": "no-cache",
+  "Sec-Ch-Ua":
+    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": '"Windows"',
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+  "Upgrade-Insecure-Requests": "1",
+  "Dnt": "1",
+};
+
+/**
+ * Provider 1 (primary) — hit YouTube's `timedtext` endpoint directly, but
+ * fetch the watch page with full browser headers first so we get a complete
+ * `ytInitialPlayerResponse` back even from serverless / datacenter IPs.
  *
- * It only works for videos that have *published* captions, but those are the
- * ones that matter most (auto-generated tracks only show up via the other
- * providers). We try English first, then fall back to any available track.
+ * YouTube serves a stripped-down page (no captionTracks, consent gate) to
+ * anything that doesn't look like a real browser. The earlier minimal
+ * User-Agent fetch worked locally but failed on Vercel because their IPs
+ * are flagged. The full header set below gets us the real page.
+ *
+ * It only works for videos that have *published* captions. We try English
+ * first, then fall back to any available track.
  */
 async function runTimedTextProvider(videoId: string): Promise<TranscriptSegment[]> {
-  // Step 1 — list available caption tracks. The watch page still serves us
-  // the tracklist even when scraping the transcript itself is blocked, but
-  // we hit the player response JSON directly which is cheaper.
-  const playerUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  // Step 1 — fetch the watch page with realistic browser headers.
+  const playerUrl = `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`;
+  console.log(`[transcript:timedtext] GET ${playerUrl}`);
   const watchRes = await fetch(playerUrl, {
-    headers: {
-      // A real desktop Chrome UA dramatically improves the chance of getting
-      // the full player response back rather than a consent/bot-check page.
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
+    headers: BROWSER_HEADERS,
     cache: "no-store",
+    redirect: "follow",
   });
 
   if (!watchRes.ok) {
@@ -127,10 +153,21 @@ async function runTimedTextProvider(videoId: string): Promise<TranscriptSegment[
     );
   }
   const html = await watchRes.text();
+  console.log(
+    `[transcript:timedtext] watch page: ${html.length} bytes, ` +
+      `consent=${/class="consent"/i.test(html)}, ` +
+      `hasPlayerResponse=${html.includes("ytInitialPlayerResponse")}`
+  );
 
   // Pull the captionTracks array out of the embedded player response.
-  // Match either `captionTracks":[{...}]` (new) or the older wrapper.
   const tracks = extractCaptionTracks(html);
+  console.log(
+    `[transcript:timedtext] extracted ${tracks.length} caption track(s): ` +
+      tracks
+        .map((t) => `${t.languageCode}${t.kind ? `(${t.kind})` : ""}`)
+        .join(", ") ||
+      "(none)"
+  );
   if (tracks.length === 0) {
     throw new Error(
       "no captionTracks found in watch page (video may be private, region-locked, or have no captions)"
@@ -145,18 +182,23 @@ async function runTimedTextProvider(videoId: string): Promise<TranscriptSegment[
     tracks.find((t) => t.languageCode.startsWith("en")) ??
     tracks[0];
 
+  console.log(
+    `[transcript:timedtext] selected track: ${preferred.languageCode}` +
+      (preferred.kind ? ` (${preferred.kind})` : "")
+  );
+
   if (!preferred.baseUrl) {
     throw new Error("selected caption track has no baseUrl");
   }
 
-  // Step 2 — fetch the actual caption XML.
+  // Step 2 — fetch the actual caption XML, with browser headers. timedtext
+  // is also gated by UA, so we send the same set.
   const captionUrl = preferred.baseUrl.replace(/&fmt=/, "&fmt=srv3");
+  console.log(`[transcript:timedtext] GET ${captionUrl.slice(0, 120)}...`);
   const captionRes = await fetch(captionUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    },
+    headers: BROWSER_HEADERS,
     cache: "no-store",
+    redirect: "follow",
   });
   if (!captionRes.ok) {
     throw new Error(
@@ -164,11 +206,17 @@ async function runTimedTextProvider(videoId: string): Promise<TranscriptSegment[
     );
   }
   const xml = await captionRes.text();
+  console.log(
+    `[transcript:timedtext] caption body: ${xml.length} bytes, ` +
+      `hasCues=${/<(p|text)\b/i.test(xml)}`
+  );
   if (!xml || !/<(p|text)\b/i.test(xml)) {
     throw new Error("timedtext returned empty or non-XML body");
   }
 
-  return parseCaptionXml(xml);
+  const segments = parseCaptionXml(xml);
+  console.log(`[transcript:timedtext] parsed ${segments.length} segment(s)`);
+  return segments;
 }
 
 interface CaptionTrack {
@@ -178,18 +226,29 @@ interface CaptionTrack {
 }
 
 function extractCaptionTracks(html: string): CaptionTrack[] {
-  // Find the `captionTracks":[{...}]` block. The JSON can be huge, so we
-  // anchor on the field name and grab the surrounding braces carefully.
+  // The watch page embeds the player response as
+  //   var ytInitialPlayerResponse = { ... };
+  // or inside a <script> tag. The captionTracks array can be hundreds of
+  // KB into that JSON, so we need to find the start of the object, parse
+  // the whole thing, and drill down — walking the string for a balanced
+  // array of `captionTracks` is fragile when the JSON contains nested
+  // objects with their own arrays.
   const out: CaptionTrack[] = [];
 
-  // The watch page embeds the player response in `ytInitialPlayerResponse = {...}`.
-  // We just need a window into the captionTracks array; the JSON is well-formed
-  // even if the rest of the page is huge.
-  const idx = html.indexOf('"captionTracks":[');
+  // First try: the most common case — the player response object is
+  // assigned to a top-level variable. Find it and JSON.parse it.
+  const playerResponse = findPlayerResponseJson(html);
+  if (playerResponse) {
+    const tracks = drillForCaptionTracks(playerResponse);
+    if (tracks.length > 0) return tracks;
+  }
+
+  // Fallback: scan the raw HTML for `"captionTracks":[ ... ]` and walk
+  // the array with a bracket counter. This catches the case where the
+  // page is partial / broken but the captionTracks block survived.
+  const idx = html.indexOf('"captionTracks":');
   if (idx === -1) return out;
 
-  // Walk the array with a brace counter rather than a regex (avoids grabbing
-  // a trailing comma / nested array mess).
   const start = html.indexOf("[", idx);
   if (start === -1) return out;
   let depth = 0;
@@ -217,24 +276,165 @@ function extractCaptionTracks(html: string): CaptionTrack[] {
   if (!Array.isArray(parsed)) return out;
 
   for (const item of parsed) {
-    if (!item || typeof item !== "object") continue;
-    const obj = item as Record<string, unknown>;
-    const baseUrl =
-      typeof obj.baseUrl === "string"
-        ? obj.baseUrl
-        : typeof obj.url === "string"
-        ? obj.url
-        : undefined;
-    const languageCode =
-      typeof obj.languageCode === "string" ? obj.languageCode : "";
-    if (!baseUrl || !languageCode) continue;
-    out.push({
-      baseUrl,
-      languageCode,
-      kind: typeof obj.kind === "string" ? obj.kind : undefined,
-    });
+    const track = normalizeCaptionTrack(item);
+    if (track) out.push(track);
   }
   return out;
+}
+
+/**
+ * Locate the `ytInitialPlayerResponse = { ... }` JSON object in the page
+ * and return it as a parsed value. Returns null if not found.
+ *
+ * YouTube has shipped the assignment in a few forms over the years:
+ *   1. `var ytInitialPlayerResponse = {...};`
+ *   2. `ytInitialPlayerResponse = {...};`
+ *   3. `window["ytInitialPlayerResponse"] = {...};`
+ *   4. Inside a `<script>` tag with escaped slashes.
+ * We handle them all by finding the opening brace and walking the string
+ * to its matching close, then JSON.parsing the slice.
+ */
+function findPlayerResponseJson(html: string): unknown | null {
+  const marker = "ytInitialPlayerResponse";
+  const idx = html.indexOf(marker);
+  if (idx === -1) return null;
+
+  // Find the first `{` after the marker.
+  const braceStart = html.indexOf("{", idx);
+  if (braceStart === -1) return null;
+
+  // Walk braces to find the matching close. This string can contain
+  // escaped quotes inside strings, so we need a real bracket walk that
+  // tracks string state.
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let end = -1;
+  for (let i = braceStart; i < html.length; i++) {
+    const ch = html[i];
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) return null;
+
+  const slice = html.slice(braceStart, end + 1);
+  try {
+    return JSON.parse(slice);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walk an already-parsed player response object looking for the
+ * captionTracks array. YouTube has moved this around — sometimes it's at
+ *   .captions.playerCaptionsTracklistRenderer.captionTracks
+ * and sometimes at
+ *   .playerCaptionsTracklistRenderer.captionTracks
+ * so we search both paths and also fall back to a deep scan.
+ */
+function drillForCaptionTracks(root: unknown): CaptionTrack[] {
+  const out: CaptionTrack[] = [];
+  if (!root || typeof root !== "object") return out;
+  const rootObj = root as Record<string, unknown>;
+
+  const candidates: unknown[] = [];
+
+  // Path 1: .captions.playerCaptionsTracklistRenderer.captionTracks
+  const captions = rootObj.captions;
+  if (captions && typeof captions === "object") {
+    const r = (captions as Record<string, unknown>)
+      .playerCaptionsTracklistRenderer;
+    if (r && typeof r === "object") {
+      const arr = (r as Record<string, unknown>).captionTracks;
+      if (Array.isArray(arr)) candidates.push(arr);
+    }
+  }
+
+  // Path 2: .playerCaptionsTracklistRenderer.captionTracks (some embeds)
+  if (candidates.length === 0) {
+    const r = rootObj.playerCaptionsTracklistRenderer;
+    if (r && typeof r === "object") {
+      const arr = (r as Record<string, unknown>).captionTracks;
+      if (Array.isArray(arr)) candidates.push(arr);
+    }
+  }
+
+  // Path 3: deep scan — find any array under a `captionTracks` key.
+  if (candidates.length === 0) {
+    const found = deepFindCaptionTracks(root);
+    if (found) candidates.push(found);
+  }
+
+  for (const arr of candidates) {
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr) {
+      const track = normalizeCaptionTrack(item);
+      if (track) out.push(track);
+    }
+  }
+  return out;
+}
+
+function deepFindCaptionTracks(node: unknown, depth = 0): unknown[] | null {
+  if (depth > 8) return null;
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const r = deepFindCaptionTracks(item, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+  const obj = node as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (key === "captionTracks" && Array.isArray(obj[key])) {
+      return obj[key] as unknown[];
+    }
+  }
+  for (const key of Object.keys(obj)) {
+    const r = deepFindCaptionTracks(obj[key], depth + 1);
+    if (r) return r;
+  }
+  return null;
+}
+
+function normalizeCaptionTrack(item: unknown): CaptionTrack | null {
+  if (!item || typeof item !== "object") return null;
+  const obj = item as Record<string, unknown>;
+  const baseUrl =
+    typeof obj.baseUrl === "string"
+      ? obj.baseUrl
+      : typeof obj.url === "string"
+      ? obj.url
+      : undefined;
+  const languageCode =
+    typeof obj.languageCode === "string" ? obj.languageCode : "";
+  if (!baseUrl || !languageCode) return null;
+  return {
+    baseUrl,
+    languageCode,
+    kind: typeof obj.kind === "string" ? obj.kind : undefined,
+  };
 }
 
 function parseCaptionXml(xml: string): TranscriptSegment[] {
@@ -340,10 +540,17 @@ async function runProvider(
  * Fetch the transcript for a YouTube video.
  *
  * Tries three providers in order:
- *   1. `youtube-transcript-plus` — Innertube + watch page (best for auto-captions)
- *   2. `youtube-transcript`     — older InnerTube path (different bot-detection profile)
- *   3. `youtube-timedtext`      — direct XML endpoint, often works on Vercel where
- *                                 the first two get 429'd from the datacenter IP range
+ *   1. `youtube-timedtext`      — direct watch page + XML endpoint with full
+ *                                 browser headers. This is the most reliable
+ *                                 path on Vercel / serverless IPs because it
+ *                                 doesn't go through YouTube's InnerTube
+ *                                 bot-detection, and the browser-like header
+ *                                 set gets us the real player response.
+ *   2. `youtube-transcript-plus` — Innertube + watch page (best for auto-captions
+ *                                 on videos with no published track)
+ *   3. `youtube-transcript`     — older InnerTube path (kept as a last-ditch
+ *                                 fallback for the rare cases where the
+ *                                 other two fail)
  *
  * Each provider's error is logged with the provider name, video id, message,
  * and stack. We never stop after a single failure unless the error is clearly
@@ -355,18 +562,30 @@ export async function fetchTranscript(
   videoId: string
 ): Promise<TranscriptSegment[]> {
   const providers = [
+    "youtube-timedtext",
     "youtube-transcript-plus",
     "youtube-transcript",
-    "youtube-timedtext",
   ] as const;
 
   const attempts: { provider: string; error: unknown }[] = [];
 
   for (const provider of providers) {
+    const startedAt = Date.now();
+    console.log(`[transcript] trying provider "${provider}" for ${videoId}`);
     try {
-      return await runProvider(provider, videoId);
+      const segments = await runProvider(provider, videoId);
+      const ms = Date.now() - startedAt;
+      console.log(
+        `[transcript] provider "${provider}" succeeded for ${videoId} ` +
+          `(${segments.length} segments in ${ms}ms)`
+      );
+      return segments;
     } catch (err) {
+      const ms = Date.now() - startedAt;
       logProviderFailure(provider, videoId, err);
+      console.error(
+        `[transcript] provider "${provider}" failed for ${videoId} after ${ms}ms`
+      );
       attempts.push({ provider, error: err });
       if (!isTransientError(err)) break;
     }
