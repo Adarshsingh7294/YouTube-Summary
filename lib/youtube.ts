@@ -44,6 +44,21 @@ export class TranscriptFetchError extends Error {
 }
 
 /**
+ * Internal sentinel — thrown by `runSupadataProvider` when
+ * `SUPADATA_API_KEY` is not set. The main `fetchTranscript` loop catches
+ * this specifically and silently moves on to the next provider instead of
+ * logging it as a hard failure (otherwise dev environments without a key
+ * would spam the logs with a misleading "Supadata failed" line on every
+ * request).
+ */
+class SupadataNotConfiguredError extends Error {
+  constructor() {
+    super("SUPADATA_API_KEY is not set");
+    this.name = "SupadataNotConfiguredError";
+  }
+}
+
+/**
  * Decide whether a thrown error from a provider is worth retrying against a
  * fallback. "Fatal" errors (invalid ID, video genuinely missing) won't get
  * better with a second provider, so we skip the fallback for those.
@@ -94,6 +109,112 @@ function logProviderFailure(
   if (stack) {
     console.error(stack);
   }
+}
+
+/**
+ * Provider 0 (primary) — Supadata.ai's hosted transcript API.
+ *
+ * YouTube tightened bot detection through 2024-2025 and now serves a
+ * consent/JS-challenge page to every direct fetch from a datacenter IP
+ * (Vercel, AWS Lambda, etc.) — even with full browser headers. The
+ * community-maintained transcript libraries and the `timedtext` scrape
+ * path stopped working reliably from serverless environments.
+ *
+ * Supadata runs the actual fetch on residential IPs and exposes a simple
+ * REST API. We hit it first; if it's not configured (no key) or fails
+ * with a non-transient error, we fall through to the local providers.
+ *
+ * Docs: https://docs.supadata.ai/youtube
+ *   GET https://api.supadata.ai/v1/youtube/transcript?url=<url>&lang=en
+ *   Headers: x-api-key: <SUPADATA_API_KEY>
+ *
+ * Response (200):
+ *   { "content": [{ "text": "...", "offset": 0, "duration": 1500 }, ...], "lang": "en" }
+ *   Note: Supadata returns `offset` and `duration` in milliseconds.
+ */
+async function runSupadataProvider(videoId: string): Promise<TranscriptSegment[]> {
+  const apiKey = process.env.SUPADATA_API_KEY;
+  if (!apiKey) {
+    // Throw a "skip" signal — the caller detects this exact message and
+    // moves on to the next provider without logging it as a hard failure.
+    throw new SupadataNotConfiguredError();
+  }
+
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const endpoint = `https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(
+    videoUrl
+  )}&lang=en`;
+
+  console.log(`[transcript:supadata] GET ${endpoint}`);
+
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      method: "GET",
+      headers: {
+        "x-api-key": apiKey,
+        Accept: "application/json",
+      },
+      cache: "no-store",
+    });
+  } catch (err) {
+    throw new Error(
+      `Supadata network error: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
+  if (!res.ok) {
+    // Try to pull a useful error message out of the body, but don't crash
+    // if the body isn't JSON.
+    const body = await res.text().catch(() => "");
+    let detail = body.slice(0, 200);
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed === "object") {
+        detail =
+          (parsed as Record<string, unknown>).message?.toString() ||
+          (parsed as Record<string, unknown>).error?.toString() ||
+          detail;
+      }
+    } catch {
+      // body wasn't JSON, keep raw text
+    }
+    throw new Error(
+      `Supadata returned HTTP ${res.status} ${res.statusText}: ${detail}`
+    );
+  }
+
+  const data = (await res.json()) as {
+    content?: Array<{ text?: string; offset?: number; duration?: number }>;
+    lang?: string;
+  };
+
+  if (!data || !Array.isArray(data.content) || data.content.length === 0) {
+    throw new Error("Supadata returned an empty transcript");
+  }
+
+  console.log(
+    `[transcript:supadata] got ${data.content.length} segment(s), lang=${
+      data.lang ?? "unknown"
+    }`
+  );
+
+  return data.content
+    .map((item) => {
+      const text = (item.text ?? "").toString().replace(/\s+/g, " ").trim();
+      // Supadata uses milliseconds — convert to seconds to match our
+      // internal segment shape.
+      const offsetMs = Number(item.offset);
+      const durationMs = Number(item.duration);
+      return {
+        text,
+        offset: Number.isFinite(offsetMs) ? offsetMs / 1000 : 0,
+        duration: Number.isFinite(durationMs) ? durationMs / 1000 : 0,
+      };
+    })
+    .filter((s) => s.text.length > 0);
 }
 
 /**
@@ -507,11 +628,16 @@ function parseCaptionXml(xml: string): TranscriptSegment[] {
  */
 async function runProvider(
   provider:
+    | "supadata"
     | "youtube-transcript-plus"
     | "youtube-transcript"
     | "youtube-timedtext",
   videoId: string
 ): Promise<TranscriptSegment[]> {
+  if (provider === "supadata") {
+    return runSupadataProvider(videoId);
+  }
+
   if (provider === "youtube-transcript-plus") {
     const items: RawSegmentPlus[] = await fetchTranscriptPlus(videoId);
     return items.map((item) => ({
@@ -539,29 +665,28 @@ async function runProvider(
 /**
  * Fetch the transcript for a YouTube video.
  *
- * Tries three providers in order:
- *   1. `youtube-timedtext`      — direct watch page + XML endpoint with full
- *                                 browser headers. This is the most reliable
- *                                 path on Vercel / serverless IPs because it
- *                                 doesn't go through YouTube's InnerTube
- *                                 bot-detection, and the browser-like header
- *                                 set gets us the real player response.
- *   2. `youtube-transcript-plus` — Innertube + watch page (best for auto-captions
+ * Tries providers in order:
+ *   1. `supadata`              — Supadata.ai hosted API (requires
+ *                                 SUPADATA_API_KEY). Most reliable on Vercel.
+ *                                 Skipped automatically if the key is unset.
+ *   2. `youtube-timedtext`      — direct watch page + XML endpoint with full
+ *                                 browser headers. Kept as a fallback for
+ *                                 local dev where Supadata isn't configured.
+ *   3. `youtube-transcript-plus` — InnerTube + watch page (best for auto-captions
  *                                 on videos with no published track)
- *   3. `youtube-transcript`     — older InnerTube path (kept as a last-ditch
- *                                 fallback for the rare cases where the
- *                                 other two fail)
+ *   4. `youtube-transcript`     — older InnerTube path (last-ditch fallback)
  *
  * Each provider's error is logged with the provider name, video id, message,
  * and stack. We never stop after a single failure unless the error is clearly
- * fatal (bad video id, video genuinely removed). After every provider has
- * failed we throw a {@link TranscriptFetchError} carrying the full attempt
- * history.
+ * fatal (bad video id, video genuinely removed, or Supadata not configured).
+ * After every provider has failed we throw a {@link TranscriptFetchError}
+ * carrying the full attempt history.
  */
 export async function fetchTranscript(
   videoId: string
 ): Promise<TranscriptSegment[]> {
   const providers = [
+    "supadata",
     "youtube-timedtext",
     "youtube-transcript-plus",
     "youtube-transcript",
@@ -582,11 +707,25 @@ export async function fetchTranscript(
       return segments;
     } catch (err) {
       const ms = Date.now() - startedAt;
+
+      // Special case: Supadata isn't configured. Skip silently and try
+      // the next provider — this is an expected state in dev, not a
+      // failure worth logging.
+      if (err instanceof SupadataNotConfiguredError) {
+        console.log(
+          `[transcript] provider "${provider}" skipped (not configured) for ${videoId}`
+        );
+        continue;
+      }
+
       logProviderFailure(provider, videoId, err);
       console.error(
         `[transcript] provider "${provider}" failed for ${videoId} after ${ms}ms`
       );
       attempts.push({ provider, error: err });
+
+      // Skip the rest of the chain without trying the other providers
+      // when the error is clearly not transient.
       if (!isTransientError(err)) break;
     }
   }

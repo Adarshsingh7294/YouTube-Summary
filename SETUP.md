@@ -30,7 +30,24 @@ Open `.env.local` and fill in:
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
+SUPADATA_API_KEY=sd_...   # optional but recommended
 ```
+
+### YouTube transcripts (Supadata)
+
+YouTube started blocking direct transcript scraping from datacenter IPs
+in 2024 — this affects Vercel, AWS Lambda, etc. To get transcripts in
+production we delegate to [Supadata.ai](https://supadata.ai), which runs
+the fetch on residential IPs and exposes a simple REST API.
+
+1. Sign up at https://supadata.ai (free tier: **100 transcripts / month**).
+2. Copy the API key from the dashboard.
+3. Paste it as `SUPADATA_API_KEY` in `.env.local`.
+
+If the key is **not** set, the app still works locally (where direct
+scraping isn't blocked) by falling back to the on-device transcript
+providers. On Vercel you'll almost certainly get
+`"We couldn't fetch a transcript..."` without it.
 
 ### Using a different provider
 
@@ -81,9 +98,15 @@ npm run start
 
 ### "Could not retrieve a transcript"
 
-The video is private, region-restricted, age-restricted, or has no
-captions. Try a different public video to confirm the rest of the pipeline
-works.
+On **Vercel** (or any datacenter-IP host), this almost always means
+YouTube blocked the direct scrape. Set `SUPADATA_API_KEY` in
+`.env.local` (and in your Vercel project's Environment Variables) — see
+the "YouTube transcripts (Supadata)" section above.
+
+On **localhost**, the video is likely private, region-restricted,
+age-restricted, or has no captions. Try a different public video
+(e.g. https://youtu.be/dQw4w9WgXcQ) to confirm the rest of the
+pipeline works.
 
 ### React 19 peer warnings
 
