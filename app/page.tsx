@@ -2,7 +2,6 @@ import UrlInput from "@/components/UrlInput";
 import SummaryDisplay from "@/components/SummaryDisplay";
 import ThemeToggle from "@/components/ThemeToggle";
 import { Sparkles, Github, Zap } from "lucide-react";
-import type { SummaryResponse } from "@/lib/types";
 
 export default function HomePage() {
   // Client-side data holder
@@ -120,7 +119,3 @@ function Footer() {
     </footer>
   );
 }
-
-// We re-export the type so client components that import from the page file
-// (e.g. via barrel imports) can still resolve it.
-export type { SummaryResponse };

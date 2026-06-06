@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   Sparkles,
   ListChecks,
@@ -17,6 +18,13 @@ import DownloadPdfButton from "./DownloadPdfButton";
 
 export default function AiNotesView({ summary }: { summary: SummaryResponse }) {
   const markdown = buildMarkdown(summary);
+  const [generatedDate, setGeneratedDate] = useState<string>("");
+  useEffect(() => {
+    // Render the date on the client only — `toLocaleDateString()` depends on
+    // the user's locale and timezone, so it can differ between the SSR pass
+    // and the first client render and trigger a React hydration mismatch.
+    setGeneratedDate(new Date().toLocaleDateString());
+  }, []);
 
   return (
     <div className="card-surface overflow-hidden animate-fade-up">
@@ -251,7 +259,7 @@ export default function AiNotesView({ summary }: { summary: SummaryResponse }) {
         <footer className="flex items-center justify-between border-t border-[rgb(var(--border))] pt-4 text-xs text-[rgb(var(--muted-foreground))]">
           <span className="inline-flex items-center gap-1.5">
             <Calendar className="h-3 w-3" />
-            Generated {new Date().toLocaleDateString()}
+            {generatedDate ? `Generated ${generatedDate}` : "Generated"}
           </span>
           <span>YouTube Summary Generator</span>
         </footer>

@@ -3,6 +3,7 @@ import {
   buildTimestamps,
   extractVideoId,
   fetchTranscript,
+  TranscriptFetchError,
   transcriptToText,
 } from "@/lib/youtube";
 import { generateAiNotes, generateTitle } from "@/lib/summarize";
@@ -127,6 +128,24 @@ export async function POST(req: NextRequest) {
             "We couldn't fetch a transcript for this video. It may be private, region-restricted, or have captions disabled.",
         },
         { status: 404 }
+      );
+    }
+    if (err instanceof TranscriptFetchError) {
+      const tried = err.attempts.map((a) => a.provider).join(" → ");
+      const last = err.attempts[err.attempts.length - 1]?.error;
+      const lastMessage =
+        last instanceof Error ? last.message.toLowerCase() : "";
+      const videoGone =
+        /video\s*unavail|invalid\s*video\s*id|video has been removed|this video is no longer available|private video/i.test(
+          lastMessage
+        );
+      return NextResponse.json(
+        {
+          error: videoGone
+            ? "This video is unavailable (it may be private, removed, or region-locked), so we can't read its transcript."
+            : `We tried ${tried} and couldn't fetch a transcript. The video may be private, region-restricted, or have captions disabled. Please try again or pick a different video.`,
+        },
+        { status: videoGone ? 404 : 502 }
       );
     }
 
