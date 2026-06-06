@@ -111,6 +111,8 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Unknown error while summarizing.";
+      console.error("FULL ERROR:", err);
+      console.error("ERROR MESSAGE:", message);
 
     if (/Missing OPENAI_API_KEY/i.test(message)) {
       return NextResponse.json(
